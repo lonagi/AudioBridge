@@ -4,17 +4,21 @@
 #   scripts/build.sh            build into ./build
 #   scripts/build.sh --install  build, then replace /Applications/AudioBridge.app and relaunch it
 #
-# Pairing config: $CONFIG, else ./connection.json, else the one inside the installed app,
-# so a rebuild keeps the existing Mac and Windows pair. Create a new pair with scripts/new-pairing.sh.
+# Pairing config: $CONFIG, else ./connection.json, else the one inside the installed app, else the
+# newest backup in ./backups, so a rebuild keeps the existing Mac and Windows pair.
+# Create a new pair with scripts/new-pairing.sh; installing a different key needs NEW_PAIRING=1.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 ROOT=$(pwd)
 OUT="$ROOT/build"
 INSTALLED=/Applications/AudioBridge.app
 
+BACKUPS="$ROOT/backups"
 if [ -z "${CONFIG:-}" ]; then
+  LATEST_BACKUP=$(ls -dt "$BACKUPS"/AudioBridge-*.app 2>/dev/null | head -1 || true)
   if [ -f "$ROOT/connection.json" ]; then CONFIG="$ROOT/connection.json"
   elif [ -f "$INSTALLED/Contents/Resources/connection.json" ]; then CONFIG="$INSTALLED/Contents/Resources/connection.json"
+  elif [ -n "$LATEST_BACKUP" ] && [ -f "$LATEST_BACKUP/Contents/Resources/connection.json" ]; then CONFIG="$LATEST_BACKUP/Contents/Resources/connection.json"
   else echo "Нет connection.json. Создайте пару: scripts/new-pairing.sh <IP Mac>" >&2; exit 1; fi
 fi
 
@@ -22,8 +26,10 @@ VERSION=$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))["Ve
 CSPROJ_VERSION=$(sed -n 's:.*<Version>\(.*\)</Version>.*:\1:p' windows/WindowsAudio.csproj)
 [ "$VERSION" = "$CSPROJ_VERSION" ] || { echo "windows-version.json ($VERSION) != WindowsAudio.csproj ($CSPROJ_VERSION)" >&2; exit 1; }
 
+# Copy the key before cleaning build/, in case CONFIG points inside it.
+CONFIG_COPY=$(mktemp); cp "$CONFIG" "$CONFIG_COPY"
 rm -rf "$OUT"; mkdir -p "$OUT"
-cp "$CONFIG" "$OUT/connection.json"
+mv "$CONFIG_COPY" "$OUT/connection.json"; chmod 600 "$OUT/connection.json"
 echo "AudioBridge $VERSION, pairing config: $CONFIG"
 
 echo "1/5 Mac receiver"
@@ -69,12 +75,32 @@ codesign --verify --deep --strict "$APP"
 echo "Готово: $APP"
 
 if [ "${1:-}" = "--install" ]; then
+  INSTALLED_CONFIG="$INSTALLED/Contents/Resources/connection.json"
+  if [ -f "$INSTALLED_CONFIG" ] && [ "${NEW_PAIRING:-}" != 1 ] && \
+     ! python3 -I -c 'import json,sys; a,b=(json.load(open(p))["Key"] for p in sys.argv[1:]); sys.exit(a!=b)' "$OUT/connection.json" "$INSTALLED_CONFIG"; then
+    echo "Ключ пары отличается от установленного: Windows перестанет подключаться. Чтобы всё же сменить пару, запустите с NEW_PAIRING=1." >&2
+    exit 1
+  fi
+  # Stage next to the target first, so the running app is only stopped once the new one is ready.
+  STAGED="/Applications/.AudioBridge.app.new"
+  rm -rf "$STAGED"; ditto "$APP" "$STAGED"
+  OLD_VERSION=$(defaults read "$INSTALLED/Contents/Info" CFBundleShortVersionString 2>/dev/null || echo old)
+  mkdir -p "$BACKUPS"
+  BACKUP="$BACKUPS/AudioBridge-$OLD_VERSION-$(date +%Y%m%d-%H%M%S).app"
+  restore() {
+    if [ ! -d "$INSTALLED" ] && [ -d "$BACKUP" ]; then mv "$BACKUP" "$INSTALLED"; fi
+    rm -rf "$STAGED"
+    open "$INSTALLED" 2>/dev/null || true
+  }
+  trap 'echo "Установка не удалась, возвращаю прежнее приложение." >&2; restore' ERR INT TERM
   osascript -e 'tell application id "local.audiobridge.receiver" to quit' >/dev/null 2>&1 || true
   for _ in $(seq 1 50); do pgrep -x AudioBridge >/dev/null || break; sleep 0.1; done
   pkill -x AudioBridge 2>/dev/null || true
-  if [ -d "$INSTALLED" ]; then ditto "$INSTALLED" "$OUT/previous/AudioBridge.app"; rm -rf "$INSTALLED"; fi
-  ditto "$APP" "$INSTALLED"
-  /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$INSTALLED"
+  if [ -d "$INSTALLED" ]; then mv "$INSTALLED" "$BACKUP"; fi
+  mv "$STAGED" "$INSTALLED"
+  trap - ERR INT TERM
+  /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$INSTALLED" || true
   open "$INSTALLED"
-  echo "Установлено и запущено: $INSTALLED (прежняя версия: $OUT/previous)"
+  echo "Установлено и запущено: $INSTALLED"
+  if [ -d "$BACKUP" ]; then echo "Прежняя версия: $BACKUP"; fi
 fi

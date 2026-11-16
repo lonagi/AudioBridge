@@ -38,6 +38,12 @@ sealed class ReceiverFinder : IDisposable
     {
         get { lock (sync) return Environment.TickCount64 - lastResponse < 8000 ? current : null; }
     }
+    /// Where to keep sending audio. Discovery answers every 2 s; a few lost answers must not silence
+    /// the stream, so audio keeps the last confirmed Mac for 30 s. A new address replaces it at once.
+    public IPEndPoint? AudioTarget
+    {
+        get { lock (sync) return Environment.TickCount64 - lastResponse < 30000 ? current : null; }
+    }
     public ReceiverFinder(Config config)
     {
         key = Convert.FromBase64String(config.Key); hint = config.MacIP;

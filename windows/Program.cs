@@ -16,6 +16,7 @@ sealed class PacketSender : IDisposable
     readonly ReceiverFinder? finder;
     readonly IPEndPoint fallback;
     readonly byte[] session = RandomNumberGenerator.GetBytes(8);
+    readonly object sendLock = new();
     uint sequence;
     public long Packets { get; private set; }
     public PacketSender(Config config, ReceiverFinder? finder = null)
@@ -42,11 +43,17 @@ sealed class PacketSender : IDisposable
     }
     public void Send(byte[] pcm, int sampleRate)
     {
-        var destination = finder == null ? fallback : finder.Current;
+        // AudioTarget tolerates a missed discovery answer or two; audio used to stop 8 s after the
+        // last answer, which a busy Mac could cause on its own.
+        var destination = finder == null ? fallback : finder.AudioTarget;
         if (destination == null) return;
-        var packet = Encode(pcm, sampleRate);
-        udp.Send(packet, destination);
-        Packets++;
+        lock (sendLock) {
+            // One sender lives for the whole process, so a capture restart keeps the session and the
+            // Mac continues the stream instead of waiting for the old session to expire.
+            var packet = Encode(pcm, sampleRate);
+            udp.Send(packet, destination);
+            Packets++;
+        }
     }
     public void Dispose() { udp.Dispose(); aes.Dispose(); }
 }
@@ -229,18 +236,27 @@ static class Program
     }
     static void RunCapture(Config config, ReceiverFinder finder, CancellationToken cancellation)
     {
+            using var sender = new PacketSender(config, finder);
+            int retryMs = 500;
             while (!cancellation.IsCancellationRequested)
             {
+                long started = Environment.TickCount64;
                 try
                 {
                     using var devices = new MMDeviceEnumerator();
                     using var device = devices.GetDefaultAudioEndpoint(DataFlow.Render, Role.Multimedia);
                     string deviceID = device.ID;
                     using var capture = new WasapiLoopbackCapture(device);
-                    using var sender = new PacketSender(config, finder);
                     using var ended = new ManualResetEventSlim();
                     Exception? failure = null;
+                    bool boosted = false;
                     capture.DataAvailable += (_, e) => {
+                        if (!boosted) {
+                            // NAudio's capture thread runs at normal priority; a game or a Discord call
+                            // can starve it and turn the stream into bursts the Mac cannot smooth out.
+                            try { Thread.CurrentThread.Priority = ThreadPriority.Highest; } catch { }
+                            boosted = true;
+                        }
                         if (failure != null || Paused) return;
                         try { SendAudio(sender, capture.WaveFormat, e.Buffer, e.BytesRecorded); }
                         catch (Exception ex) { failure = ex; ended.Set(); }
@@ -263,8 +279,12 @@ static class Program
                 }
                 catch (Exception e)
                 {
-                    Log($"Не удалось передать звук: {e.Message}\nПовтор через 3 секунды…");
-                    for (int i = 0; i < 30 && !cancellation.IsCancellationRequested; i++) Thread.Sleep(100);
+                    // Device hand-offs (headphones, Bluetooth, an app reconfiguring the endpoint) usually
+                    // settle within a second, so retry quickly and back off only if it keeps failing.
+                    if (Environment.TickCount64 - started > 10000) retryMs = 500;
+                    Log($"Не удалось передать звук: {e.Message}\nПовтор через {retryMs} мс…");
+                    for (int waited = 0; waited < retryMs && !cancellation.IsCancellationRequested; waited += 100) Thread.Sleep(100);
+                    retryMs = Math.Min(retryMs * 2, 3000);
                 }
             }
     }

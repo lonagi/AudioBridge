@@ -152,7 +152,7 @@ sealed class MicrophoneClient : IDisposable
     public void LostContact()
     {
         lock (sync) {
-            if (Environment.TickCount64 - lastContact > 5000) { StopStream(); RestoreDefaults(); state = null; status = "Нет связи с Mac — микрофон выключен"; }
+            if (Environment.TickCount64 - lastContact > 5000) { StopStream(); RestoreDefaults(); state = null; status = "Нет связи с Mac, микрофон выключен"; }
         }
     }
     void StopStream() { try { streamCancel?.Cancel(); } catch (ObjectDisposedException) { } streamCancel = null; signature = ""; }

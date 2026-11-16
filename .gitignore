@@ -1,10 +1,12 @@
 # Pairing config holds the private AES key and download token. Never commit it.
 connection.json
 *.connection.json
+connection*.json*
 stale-address.json
 
 # Packages and bundles built from a private connection.json
 Windows-Audio.zip
+*.zip
 *.app/
 build/
 

@@ -92,6 +92,11 @@ final class MicrophoneHub {
     var lastSeen: TimeInterval = 0
     var connection: NWConnection?
     var engine: AVAudioEngine?
+    var captureObserver: NSObjectProtocol?
+    var captureFormat: AVAudioFormat?
+    var captureRetries = 0
+    var restartTimes: [TimeInterval] = []
+    var lastTapBuffer: TimeInterval = 0
     var streamKey: SymmetricKey?
     var sequence: UInt64 = 0
     var generation = 0
@@ -140,7 +145,7 @@ final class MicrophoneHub {
     func disable(_ message: String) { enabled = false; revision += 1; status = message; stopStream() }
     func stopStream() {
         generation += 1
-        if let engine { engine.inputNode.removeTap(onBus: 0); engine.stop(); self.engine = nil }
+        stopCaptureEngine()
         connection?.cancel(); connection = nil; streamKey = nil; inFlight = 0; peak = 0
     }
     func tick() {
@@ -149,12 +154,18 @@ final class MicrophoneHub {
             sources = MicHardware.sources(); lastHardwareCheck = now
             if enabled && !sources.contains(where: { $0.Id == source && $0.Available }) { disable("Микрофон отключён от Mac. Выберите источник заново.") }
         }
-        if enabled && !connected { disable("Связь с Windows потеряна — микрофон выключен.") }
+        if enabled && !connected { disable("Связь с Windows потеряна, микрофон выключен.") }
+        // Backstop in case macOS stopped the capture without a notification.
+        if enabled, connection != nil, let engine, captureObserver != nil {
+            if !engine.isRunning { restartCapture(generation) }
+            // Running but silent: the device changed under the tap without stopping the engine.
+            else if now - lastTapBuffer > 2 { restartCapture(generation, force: true) }
+        }
         peak *= 0.85
     }
     func openStream(_ connection: NWConnection, stream: String) {
         stopStream(); self.connection = connection
-        streamKey = MicPacket.key(pairing, stream: stream); sequence = 0
+        streamKey = MicPacket.key(pairing, stream: stream); sequence = 0; captureRetries = 0
         let expected = generation
         if syntheticTest {
             send(Data(repeating: 0, count: 960), rate: 48000, peak: 0, expected: expected)
@@ -174,8 +185,41 @@ final class MicrophoneHub {
         default: disable("Нет разрешения на микрофон. Разрешите AudioBridge в настройках macOS.")
         }
     }
+    func stopCaptureEngine() {
+        if let captureObserver { NotificationCenter.default.removeObserver(captureObserver) }
+        captureObserver = nil
+        if let engine { engine.inputNode.removeTap(onBus: 0); engine.stop(); self.engine = nil }
+        captureFormat = nil
+    }
+    /// The input device changed under a running capture (headphones, Bluetooth profile, another app
+    /// taking the device). Rebuild only the capture engine; the stream to Windows stays open.
+    func restartCapture(_ expected: Int, force: Bool = false) {
+        guard generation == expected, let engine else { return }
+        // Same device, same format: just start the engine again. That sets no device, so it does
+        // not trigger another configuration change.
+        let hardware = engine.inputNode.inputFormat(forBus: 0)
+        if !force, let captureFormat, hardware.sampleRate == captureFormat.sampleRate, hardware.channelCount == captureFormat.channelCount {
+            if (try? engine.start()) != nil, engine.isRunning { return }
+        }
+        let now = ProcessInfo.processInfo.systemUptime
+        restartTimes = restartTimes.filter { now - $0 < 30 } + [now]
+        guard restartTimes.count <= 6 else {
+            restartTimes.removeAll(); disable("Микрофон Mac постоянно переключается. Включите его снова."); return
+        }
+        stopCaptureEngine()
+        status = "Восстанавливаю микрофон после смены устройства…"
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in self?.startCapture(expected) }
+    }
+    func retryCapture(_ expected: Int, _ reason: String) {
+        captureRetries += 1
+        guard captureRetries <= 10 else { disable("Ошибка микрофона: \(reason)"); return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in self?.startCapture(expected) }
+    }
     func startCapture(_ expected: Int) {
-        guard enabled, connected, generation == expected, let device = MicHardware.devices().first(where: { $0.source.Id == source }) else { return }
+        guard enabled, connected, generation == expected, connection != nil, engine == nil else { return }
+        guard let device = MicHardware.devices().first(where: { $0.source.Id == source }) else {
+            retryCapture(expected, "выбранный микрофон не найден"); return
+        }
         do {
             let capture = AVAudioEngine()
             let input = capture.inputNode
@@ -187,8 +231,14 @@ final class MicrophoneHub {
             var id = device.id
             let result = AudioUnitSetProperty(unit, kAudioOutputUnitProperty_CurrentDevice, kAudioUnitScope_Global, 0, &id, UInt32(MemoryLayout<AudioDeviceID>.size))
             guard result == noErr else { throw NSError(domain: "Не удалось выбрать микрофон", code: Int(result)) }
-            let format = input.outputFormat(forBus: 0)
-            guard format.channelCount > 0, (8000...192000).contains(format.sampleRate), format.commonFormat == .pcmFormatFloat32 else { throw NSError(domain: "Неподдерживаемый формат микрофона", code: 2) }
+            // Tap at the selected device's own format. outputFormat(forBus:) still describes the macOS
+            // default input after the device switch above, and tapping with it raised the
+            // "format mismatch" exception that crashed the app whenever the two rates differed.
+            let hardware = input.inputFormat(forBus: 0)
+            guard hardware.channelCount > 0, (8000...192000).contains(hardware.sampleRate),
+                  let format = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: hardware.sampleRate, channels: hardware.channelCount, interleaved: false) else {
+                retryCapture(expected, "формат устройства меняется"); return
+            }
             input.installTap(onBus: 0, bufferSize: 480, format: format) { [weak self] buffer, _ in
                 guard let channels = buffer.floatChannelData else { return }
                 let frames = Int(buffer.frameLength), count = Int(buffer.format.channelCount)
@@ -205,13 +255,24 @@ final class MicrophoneHub {
                 let rate = UInt32(buffer.format.sampleRate)
                 DispatchQueue.main.async { self?.send(pcm, rate: rate, peak: peak, expected: expected) }
             }
-            engine = capture
+            engine = capture; captureFormat = format
+            captureObserver = NotificationCenter.default.addObserver(forName: .AVAudioEngineConfigurationChange, object: capture, queue: .main) { [weak self, weak capture] _ in
+                // Selecting the device above makes AVAudioEngine post this once while it keeps running.
+                // A real hand-off stops the engine first, so only react to that.
+                guard let self, let capture, capture === self.engine, !capture.isRunning else { return }
+                self.restartCapture(expected)
+            }
             capture.prepare(); try capture.start()
+            captureRetries = 0; lastTapBuffer = ProcessInfo.processInfo.systemUptime
             status = "Передаю: \(device.source.Name) → Windows"
-        } catch { disable("Ошибка микрофона: \(error.localizedDescription)") }
+        } catch {
+            stopCaptureEngine()
+            retryCapture(expected, error.localizedDescription)
+        }
     }
     func send(_ pcm: Data, rate: UInt32, peak: Float, expected: Int) {
         guard enabled, connected, expected == generation, let connection, let key = streamKey else { return }
+        lastTapBuffer = ProcessInfo.processInfo.systemUptime
         self.peak = max(self.peak, peak)
         for offset in stride(from: 0, to: pcm.count, by: 960) {
             guard inFlight < 24, sequence < UInt64.max else {

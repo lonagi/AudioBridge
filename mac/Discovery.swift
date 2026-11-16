@@ -14,17 +14,26 @@ enum DiscoveryProtocol {
     }
 }
 
+/// Answers discovery on its own queue: Windows stops sending audio when answers stop,
+/// so a busy main thread must never delay them.
 final class DiscoveryServer {
     let key: SymmetricKey
     let port: UInt16
+    let queue = DispatchQueue(label: "local.audiobridge.discovery")
     var listener: NWListener?
     var connections: [ObjectIdentifier: NWConnection] = [:]
-    var error: String?
+    private let errorLock = NSLock()
+    private var lastError: String?
+    var error: String? {
+        get { errorLock.lock(); defer { errorLock.unlock() }; return lastError }
+        set { errorLock.lock(); lastError = newValue; errorLock.unlock() }
+    }
     init(config: Configuration) {
         key = SymmetricKey(data: Data(base64Encoded: config.Key)!)
         port = config.Port
     }
-    func start() {
+    func start() { queue.async { self.startListener() } }
+    private func startListener() {
         do {
             let listener = try NWListener(using: .udp, on: 49153)
             self.listener = listener
@@ -35,7 +44,7 @@ final class DiscoveryServer {
                 case .failed(let error):
                     self.error = error.localizedDescription
                     self.listener?.cancel()
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in self?.start() }
+                    self.queue.asyncAfter(deadline: .now() + 2) { [weak self] in self?.startListener() }
                 default: break
                 }
             }
@@ -49,23 +58,25 @@ final class DiscoveryServer {
                     default: break
                     }
                 }
-                connection.start(queue: .main)
+                connection.start(queue: self.queue)
                 connection.receiveMessage { [weak self] data, _, _, failure in
                     guard let self, failure == nil, let data,
                           let response = DiscoveryProtocol.response(to: data, key: self.key, port: self.port) else { connection.cancel(); return }
                     connection.send(content: response, completion: .contentProcessed { _ in connection.cancel() })
                 }
-                DispatchQueue.main.asyncAfter(deadline: .now() + 3) { connection.cancel() }
+                self.queue.asyncAfter(deadline: .now() + 3) { connection.cancel() }
             }
-            listener.start(queue: .main)
+            listener.start(queue: queue)
         } catch {
             self.error = error.localizedDescription
-            DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in self?.start() }
+            self.queue.asyncAfter(deadline: .now() + 2) { [weak self] in self?.startListener() }
         }
     }
     func stop() {
-        listener?.stateUpdateHandler = nil
-        listener?.cancel()
-        for connection in connections.values { connection.cancel() }
+        queue.sync {
+            listener?.stateUpdateHandler = nil
+            listener?.cancel()
+            for connection in connections.values { connection.cancel() }
+        }
     }
 }

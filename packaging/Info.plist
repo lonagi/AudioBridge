@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleExecutable</key>
+	<string>AudioBridge</string>
+	<key>CFBundleIconFile</key>
+	<string>AudioBridge.icns</string>
+	<key>CFBundleIdentifier</key>
+	<string>local.audiobridge.receiver</string>
+	<key>CFBundleName</key>
+	<string>AudioBridge</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.4.2</string>
+	<key>CFBundleVersion</key>
+	<string>6</string>
+	<key>LSApplicationCategoryType</key>
+	<string>public.app-category.music</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>13.0</string>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>Принимать звук Windows и предоставить ссылку для загрузки отправителя в вашей локальной сети.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Передавать выбранный микрофон Mac на ваш Windows-компьютер, только когда вы включите этот режим в AudioBridge.</string>
+</dict>
+</plist>

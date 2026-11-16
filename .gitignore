@@ -1,0 +1,29 @@
+# Pairing config holds the private AES key and download token. Never commit it.
+connection.json
+*.connection.json
+stale-address.json
+
+# Packages and bundles built from a private connection.json
+Windows-Audio.zip
+*.app/
+build/
+
+# Build outputs
+AudioBridge
+publish-win/
+test-host/
+windows/bin/
+windows/obj/
+AudioBridge.iconset/
+AudioBridge.icns
+
+# Test fixtures and runtime diagnostics
+*.bin
+current-status.json
+status.json
+status.log
+update-tests/
+backups/
+audiorelay-inspect/
+
+.DS_Store
